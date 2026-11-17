@@ -41,7 +41,7 @@ jobs:
         working-directory: aseprite-source
         run: |
           set -euo pipefail
-          skia_url="$(source laf/misc/skia-url.sh | xargs)"
+          skia_url="$(bash laf/misc/skia-url.sh Release)"
           skia_file="$(basename "$skia_url")"
           curl --fail --location --retry 3 --output "$skia_file" "$skia_url"
           mkdir -p skia
