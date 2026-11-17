@@ -1,0 +1,175 @@
+name: Build Aseprite (Windows x64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aseprite-windows-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build latest upstream main
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out this workflow repository
+        uses: actions/checkout@v7
+
+      - name: Check out latest Aseprite source
+        uses: actions/checkout@v7
+        with:
+          repository: aseprite/aseprite
+          ref: main
+          submodules: recursive
+          path: aseprite-source
+
+      - name: Set up MSVC x64
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+
+      - name: Set up Ninja
+        uses: aseprite/get-ninja@main
+
+      - name: Download Skia
+        shell: bash
+        working-directory: aseprite-source
+        run: |
+          set -euo pipefail
+          skia_url="$(source laf/misc/skia-url.sh | xargs)"
+          skia_file="$(basename "$skia_url")"
+          curl --fail --location --retry 3 --output "$skia_file" "$skia_url"
+          mkdir -p skia
+          unzip -q "$skia_file" -d skia
+
+      - name: Configure Aseprite
+        shell: bash
+        working-directory: aseprite-source
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=ON \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR="$PWD/skia" \
+            -DSKIA_LIBRARY_DIR="$PWD/skia/out/Release-x64"
+
+      - name: Compile Aseprite
+        shell: bash
+        working-directory: aseprite-source
+        run: cmake --build build --target aseprite --parallel
+
+      - name: Package application and required runtime DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $env:GITHUB_WORKSPACE 'aseprite-source\build\bin'
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'aseprite-windows-x64'
+
+          if (-not (Test-Path (Join-Path $bin 'aseprite.exe'))) {
+            throw "Build output not found: $bin\aseprite.exe"
+          }
+
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path (Join-Path $bin '*') -Destination $stage -Recurse -Force
+
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction Stop).Source
+          $systemDirs = @(
+            (Join-Path $env:WINDIR 'System32'),
+            (Join-Path $env:WINDIR 'SysWOW64')
+          )
+          $searchDirs = @(
+            $env:PATH -split ';' |
+              Where-Object { $_ -and (Test-Path $_) } |
+              Select-Object -Unique
+          )
+
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          Get-ChildItem -Path $stage -Recurse -File |
+            Where-Object { $_.Extension -in '.exe', '.dll' } |
+            ForEach-Object { $queue.Enqueue($_.FullName) }
+
+          $scanned = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+          )
+
+          while ($queue.Count -gt 0) {
+            $binary = $queue.Dequeue()
+            if (-not $scanned.Add($binary)) { continue }
+
+            $imports = & $dumpbin /DEPENDENTS $binary 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin could not inspect $binary"
+            }
+
+            $dllNames = $imports |
+              ForEach-Object {
+                if ("$_" -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') {
+                  $Matches[1]
+                }
+              } |
+              Select-Object -Unique
+
+            foreach ($dll in $dllNames) {
+              if ($dll -match '^(api-ms-win-|ext-ms-win-)') { continue }
+
+              $alreadyPackaged = Get-ChildItem -Path $stage -Recurse -File |
+                Where-Object { $_.Name -ieq $dll } |
+                Select-Object -First 1
+              if ($alreadyPackaged) { continue }
+
+              $isWindowsDll = $false
+              foreach ($dir in $systemDirs) {
+                if (Test-Path (Join-Path $dir $dll)) {
+                  $isWindowsDll = $true
+                  break
+                }
+              }
+              if ($isWindowsDll) { continue }
+
+              $resolved = $null
+              foreach ($dir in $searchDirs) {
+                $candidate = Join-Path $dir $dll
+                if (Test-Path $candidate -PathType Leaf) {
+                  $resolved = $candidate
+                  break
+                }
+              }
+
+              if (-not $resolved) {
+                throw "Unresolved non-system runtime dependency '$dll' imported by '$binary'."
+              }
+
+              $destination = Join-Path $stage $dll
+              Copy-Item -Path $resolved -Destination $destination -Force
+              Write-Host "Bundled runtime dependency: $dll"
+              $queue.Enqueue($destination)
+            }
+          }
+
+          Write-Host 'Packaged files:'
+          Get-ChildItem -Path $stage -Recurse -File |
+            ForEach-Object { Write-Host $_.FullName }
+
+          if (-not (Test-Path (Join-Path $stage 'data'))) {
+            throw 'The Aseprite data directory is missing from the package.'
+          }
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\aseprite-windows-x64\*" -DestinationPath "$env:GITHUB_WORKSPACE\aseprite-windows-x64.zip" -CompressionLevel Optimal
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aseprite-windows-x64
+          path: aseprite-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
